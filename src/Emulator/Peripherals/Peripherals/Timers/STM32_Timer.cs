@@ -59,13 +59,14 @@ namespace Antmicro.Renode.Peripherals.Timers
                     enableRequested = false;
                 }
 
-                Limit = autoReloadValue;
+                Limit = (ulong)autoReloadValue + 1;
                 this.Log(LogLevel.Noisy, "IRQ pending");
                 updateInterruptFlag = true;
 
                 for(var i = 0; i < NumberOfCCChannels; ++i)
                 {
                     var channel = channels[i];
+                    channel.ApplyComparePreload();
                     channel.UpdateTimer();
                     if(!channel.Timer.Enabled || !channel.IsOutputMode)
                     {
@@ -148,7 +149,7 @@ namespace Antmicro.Renode.Peripherals.Timers
                         {
                             return;
                         }
-                        Enabled = enableRequested && autoReloadValue > 0;
+                        Enabled = enableRequested;
                     }, valueProviderCallback: _ => enableRequested, name: "Counter enable (CEN)")
                     .WithFlag(1, out updateDisable, name: "Update disable (UDIS)")
                     .WithFlag(2, out updateRequestSource, name: "Update request source (URS)")
@@ -200,7 +201,7 @@ namespace Antmicro.Renode.Peripherals.Timers
                         }
                         else
                         {
-                            Enabled = enableRequested && autoReloadValue > 0;
+                            Enabled = enableRequested;
                         }
                     }, name: "Slave mode selection (SMS)")
                     .WithTaggedFlag("OCREF clear selection (OCCS)", 3)
@@ -278,6 +279,7 @@ namespace Antmicro.Renode.Peripherals.Timers
                             Value = autoReloadValue;
                         }
 
+                        Limit = (ulong)autoReloadValue + 1;
                         repetitionsLeft = (uint)repetitionCounter.Value;
 
                         if(!updateRequestSource.Value && updateInterruptEnable.Value)
@@ -287,10 +289,9 @@ namespace Antmicro.Renode.Peripherals.Timers
                         }
                         for(var i = 0; i < NumberOfCCChannels; ++i)
                         {
-                            if(channels[i].Timer.Enabled)
-                            {
-                                channels[i].Timer.Value = Value;
-                            }
+                            channels[i].ApplyComparePreload();
+                            channels[i].UpdateTimer();
+                            UpdatePwmOutput(i);
                         }
                     }, name: "Update generation (UG)")
                     .WithTag("Capture/compare 1 generation (CC1G)", 1, 1)
@@ -361,10 +362,10 @@ namespace Antmicro.Renode.Peripherals.Timers
                     .WithValueField(0, timerCounterLengthInBits, writeCallback: (_, val) =>
                     {
                         autoReloadValue = (uint)val;
-                        Enabled = enableRequested && autoReloadValue > 0;
+                        Enabled = enableRequested;
                         if(!autoReloadPreloadEnable.Value)
                         {
-                            Limit = autoReloadValue;
+                            Limit = (ulong)autoReloadValue + 1;
                         }
                     }, valueProviderCallback: _ => autoReloadValue, name: "Auto-reload value (ARR)")
                     .WithReservedBits(timerCounterLengthInBits, 32 - timerCounterLengthInBits)
@@ -393,18 +394,19 @@ namespace Antmicro.Renode.Peripherals.Timers
             {
                 var j = i;
                 registers.AddConditionalRegister((long)Registers.CaptureOrCompare1 + (j * 0x4), new DoubleWordRegister(this)
-                    .WithValueField(0, timerCounterLengthInBits, valueProviderCallback: _ => channels[j].Timer.Limit, writeCallback: (_, val) =>
+                    .WithValueField(0, timerCounterLengthInBits, valueProviderCallback: _ => channels[j].CompareValue, writeCallback: (_, val) =>
                     {
-                        if(val == 0)
+                        channels[j].CompareValue = val;
+                        if(!channels[j].ComparePreloadEnabled)
                         {
-                            channels[j].Timer.Enabled = false;
+                            channels[j].Timer.Limit = val;
                         }
-                        channels[j].Timer.Limit = val;
                     }, name: String.Format("Capture/compare value {0} (CCR{0})", j + 1))
                     .WithReservedBits(timerCounterLengthInBits, 32 - timerCounterLengthInBits)
                     .WithWriteCallback((_, __) =>
                     {
                         channels[j].UpdateTimer();
+                        UpdatePwmOutput(j);
                         UpdateInterrupts();
                     })
                     , () => channels[j].IsOutputMode
@@ -434,7 +436,13 @@ namespace Antmicro.Renode.Peripherals.Timers
                 {
                     register
                         .WithTaggedFlag($"Output compare {idx + 1} fast enable (OC{idx + 1}FE)", bitOffset + 2)
-                        .WithTaggedFlag($"Output compare {idx + 1} preload enable (OC{idx + 1}PE)", bitOffset + 3)
+                        .WithFlag(bitOffset + 3, valueProviderCallback: _ => channel.ComparePreloadEnabled,
+                            writeCallback: (_, val) =>
+                            {
+                                channel.ComparePreloadEnabled = val;
+                                if(!val) channel.Timer.Limit = channel.CompareValue;
+                            },
+                            name: $"Output compare {idx + 1} preload enable (OC{idx + 1}PE)")
                         .WithEnumField(bitOffset + 4, 3, out channel.CompareMode,
                             writeCallback: (_, val) =>
                             {
@@ -568,6 +576,19 @@ namespace Antmicro.Renode.Peripherals.Timers
             UpdateInterrupts();
         }
 
+        public override ulong Frequency
+        {
+            get => base.Frequency;
+            set
+            {
+                base.Frequency = value;
+                foreach(var channel in channels)
+                {
+                    channel.Timer.Frequency = value;
+                }
+            }
+        }
+
         [DefaultInterrupt]
         public GPIO IRQ { get; } = new GPIO();
 
@@ -675,7 +696,7 @@ namespace Antmicro.Renode.Peripherals.Timers
 
             if(value && !Enabled)
             {
-                Enabled = enableRequested && autoReloadValue > 0;
+                Enabled = enableRequested;
             }
         }
 
@@ -689,6 +710,26 @@ namespace Antmicro.Renode.Peripherals.Timers
             for(var i = 0; i < NumberOfCCChannels; ++i)
             {
                 channels[i].UpdateTimer();
+                UpdatePwmOutput(i);
+            }
+        }
+
+        private void UpdatePwmOutput(int i)
+        {
+            var channel = channels[i];
+            if(!Enabled || !channel.OutputEnable || !channel.IsOutputMode)
+            {
+                return;
+            }
+
+            switch(channel.CompareMode.Value)
+            {
+            case OutputCompareMode.PwmMode1:
+                channel.Connection.Set(Value < channel.Timer.Limit);
+                break;
+            case OutputCompareMode.PwmMode2:
+                channel.Connection.Set(Value >= channel.Timer.Limit);
+                break;
             }
         }
 
@@ -696,6 +737,7 @@ namespace Antmicro.Renode.Peripherals.Timers
         {
             channels[i].OutputEnable = value;
             channels[i].UpdateTimer();
+            UpdatePwmOutput(i);
             if(!value)
             {
                 channels[i].Connection.Unset();
@@ -734,6 +776,7 @@ namespace Antmicro.Renode.Peripherals.Timers
                 channels[i].Connection.Set();
                 break;
             }
+            UpdatePwmOutput(i);
         }
 
         private void ClaimCaptureCompareInterrupt(int i, bool value)
@@ -822,6 +865,16 @@ namespace Antmicro.Renode.Peripherals.Timers
                 Mode = CaptureCompareSelection.Output;
                 Signal = false;
                 Connection.Unset();
+                CompareValue = (uint)Timer.Limit;
+                ComparePreloadEnabled = false;
+            }
+
+            public void ApplyComparePreload()
+            {
+                if(ComparePreloadEnabled)
+                {
+                    Timer.Limit = CompareValue;
+                }
             }
 
             public void SetInput(bool value)
@@ -865,6 +918,8 @@ namespace Antmicro.Renode.Peripherals.Timers
             public bool IsCrossInput => Mode == CaptureCompareSelection.InputTiCross;
 
             public IEnumRegisterField<OutputCompareMode> CompareMode;
+            public bool ComparePreloadEnabled;
+            public uint CompareValue;
             public IEnumRegisterField<InputPrescaler> Prescaler;
             public IFlagRegisterField OvercaptureFlag;
             public IFlagRegisterField ComplementaryPolarity;
