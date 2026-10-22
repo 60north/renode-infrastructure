@@ -68,20 +68,7 @@ namespace Antmicro.Renode.Peripherals.Timers
                     var channel = channels[i];
                     channel.ApplyComparePreload();
                     channel.UpdateTimer();
-                    if(!channel.Timer.Enabled || !channel.IsOutputMode)
-                    {
-                        continue;
-                    }
-
-                    switch(channel.CompareMode.Value)
-                    {
-                    case OutputCompareMode.PwmMode1:
-                        channel.Connection.Set();
-                        break;
-                    case OutputCompareMode.PwmMode2:
-                        channel.Connection.Unset();
-                        break;
-                    }
+                    UpdatePwmOutput(i);
                 }
 
                 if(updateInterruptEnable.Value && repetitionsLeft == 0)
@@ -440,7 +427,10 @@ namespace Antmicro.Renode.Peripherals.Timers
                             writeCallback: (_, val) =>
                             {
                                 channel.ComparePreloadEnabled = val;
-                                if(!val) channel.Timer.Limit = channel.CompareValue;
+                                if(!val)
+                                {
+                                    channel.Timer.Limit = channel.CompareValue;
+                                }
                             },
                             name: $"Output compare {idx + 1} preload enable (OC{idx + 1}PE)")
                         .WithEnumField(bitOffset + 4, 3, out channel.CompareMode,
