@@ -383,7 +383,7 @@ namespace Antmicro.Renode.Peripherals.Timers
                 registers.AddConditionalRegister((long)Registers.CaptureOrCompare1 + (j * 0x4), new DoubleWordRegister(this)
                     .WithValueField(0, timerCounterLengthInBits, valueProviderCallback: _ => channels[j].CompareValue, writeCallback: (_, val) =>
                     {
-                        channels[j].CompareValue = val;
+                        channels[j].CompareValue = (uint)val;
                         if(!channels[j].ComparePreloadEnabled)
                         {
                             channels[j].Timer.Limit = val;
